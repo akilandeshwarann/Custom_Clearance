@@ -36,6 +36,10 @@ def main():
     for ch in range(1, 100):
         ch_str = f"{ch:02d}"
         records = fetch_chapter(ch)
+        # WRITE THE SUCCESSFULLY FETCHED CHAPTER HERE
+    with open("hts_full.json", "a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
         count = len(records)
         chapter_breakdown[ch_str] = count
 
