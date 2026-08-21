@@ -29,17 +29,18 @@ def fetch_chapter(chapter_num, max_retries=3, retry_delay=2):
 
 def main():
     print("Starting HTS bulk data collection by chapters (01 to 99)...")
-    
+
     unique_records = {}
     chapter_breakdown = {}
 
     for ch in range(1, 100):
         ch_str = f"{ch:02d}"
         records = fetch_chapter(ch)
-        # WRITE THE SUCCESSFULLY FETCHED CHAPTER HERE
-    with open("hts_full.json", "a", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record) + "\n")
+
+        with open("hts_full.json", "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
         count = len(records)
         chapter_breakdown[ch_str] = count
 
@@ -50,6 +51,7 @@ def main():
         print(f"Chapter {ch_str}: {count} records returned.")
 
     merged_list = list(unique_records.values())
+    # ... rest unchanged
 
     print("\n" + "=" * 50)
     print("PER-CHAPTER BREAKDOWN:")
