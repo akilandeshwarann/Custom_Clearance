@@ -31,6 +31,7 @@ Optional filters:
 """
 
 import sys
+import re
 import json
 import pickle
 
@@ -42,6 +43,14 @@ from step4_index import tokenize  # reuse the same tokenizer used to build the B
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 RRF_K = 60
+
+# Matches a query that IS an HTS code, in whole (e.g. "0101", "0101.21.00.10"),
+# as opposed to a query that merely *contains* one among other words.
+_FULL_CODE_PATTERN = re.compile(r"^\d{2,4}(\.\d{2}){0,3}$")
+
+
+def looks_like_hts_code(query):
+    return bool(_FULL_CODE_PATTERN.match(query.strip()))
 
 
 class HybridRetriever:
@@ -98,7 +107,7 @@ class HybridRetriever:
             return False
         return True
 
-    def dense_search(self, query, top_k=20, chapter=None, prefix=None):
+    def dense_search(self, query, top_k=20, chapter=None, prefix=None, min_score=None):
         query_vec = self.model.encode([query], convert_to_numpy=True).astype("float32")
         faiss.normalize_L2(query_vec)
 
@@ -112,6 +121,16 @@ class HybridRetriever:
         results = []
         for idx, score in zip(indices[0], scores[0]):
             if idx < 0 or idx >= len(self.faiss_records):
+                continue
+            # For queries that are mostly/only digits and punctuation (e.g. a
+            # raw HTS code), the embedding model has little real semantic
+            # signal to work with, and cosine similarity can surface
+            # coincidentally "nearby" but domain-irrelevant chunks (other
+            # numeric-heavy text like CAS numbers or subheading lists). A
+            # minimum-similarity floor keeps that noise out of the fused
+            # ranking instead of letting it compete with a genuine BM25
+            # exact match.
+            if min_score is not None and float(score) < min_score:
                 continue
             record = self.faiss_records[idx]
             if not self._matches_filters(record, chapter, prefix):
@@ -143,33 +162,77 @@ class HybridRetriever:
     # Hybrid retrieval (Reciprocal Rank Fusion)
     # ------------------------------------------------------------------
 
-    def hybrid_search(self, query, top_k=10, chapter=None, prefix=None, rrf_k=RRF_K, candidate_k=50):
+    def hybrid_search(
+        self,
+        query,
+        top_k=10,
+        chapter=None,
+        prefix=None,
+        rrf_k=RRF_K,
+        candidate_k=50,
+        weight_dense=1.0,
+        weight_sparse=1.0,
+        min_dense_score=0.15,
+        route_by_query_type=True,
+    ):
         """
         Runs dense and sparse search independently, then fuses their
-        rankings with Reciprocal Rank Fusion:
+        rankings with (weighted) Reciprocal Rank Fusion:
 
-            score(doc) = 1 / (rrf_k + dense_rank) + 1 / (rrf_k + sparse_rank)
+            score(doc) = weight_dense  * 1/(rrf_k + dense_rank)
+                       + weight_sparse * 1/(rrf_k + sparse_rank)
 
         A document only present in one list still gets a (smaller) score
         from that list alone, so it can still surface in the fused
         results - it just won't get the fusion bonus a doc that ranks
         well in both lists receives.
+
+        `min_dense_score` filters out weak dense hits before fusion, but
+        this alone can't fix queries that are themselves a bare HTS code
+        (e.g. "0101.21.00.10"): a short, digit/punctuation-heavy query has
+        almost no semantic content for the embedding model to work with,
+        so even its *top* dense match can score respectably high purely by
+        superficial (numeric/formatting) similarity, without being weak
+        enough for a threshold to catch - while the actual correct chunk
+        may itself score low on the dense side and get filtered out.
+
+        `route_by_query_type`, when True, detects whole-HTS-code queries
+        and skips dense search for them entirely, relying purely on BM25's
+        exact-token match. This is the more robust fix: routing based on
+        query type rather than trying to out-threshold embedding noise.
         """
-        dense_results = self.dense_search(query, top_k=candidate_k, chapter=chapter, prefix=prefix)
+        use_dense = not (route_by_query_type and looks_like_hts_code(query))
+
+        dense_results = (
+            self.dense_search(
+                query, top_k=candidate_k, chapter=chapter, prefix=prefix, min_score=min_dense_score
+            )
+            if use_dense
+            else []
+        )
         sparse_results = self.sparse_search(query, top_k=candidate_k, chapter=chapter, prefix=prefix)
 
         rrf_scores = {}
         record_lookup = {}
 
         for rank, (doc_id, _score, record) in enumerate(dense_results, start=1):
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + weight_dense / (rrf_k + rank)
             record_lookup[doc_id] = record
 
         for rank, (doc_id, _score, record) in enumerate(sparse_results, start=1):
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            # Skip zero-score sparse "matches" - BM25 returns a full score
+            # array, and untied-but-irrelevant docs can otherwise still
+            # earn a small fusion credit purely from their position in a
+            # tie block of genuinely non-matching documents.
+            if _score <= 0.0:
+                continue
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + weight_sparse / (rrf_k + rank)
             record_lookup.setdefault(doc_id, record)
 
-        ranked_ids = sorted(rrf_scores.keys(), key=lambda d: rrf_scores[d], reverse=True)[:top_k]
+        # Tie-break deterministically on doc_id rather than dict insertion
+        # order, so results are reproducible regardless of which retrieval
+        # mode happened to run first.
+        ranked_ids = sorted(rrf_scores.keys(), key=lambda d: (-rrf_scores[d], d))[:top_k]
 
         results = []
         for doc_id in ranked_ids:
@@ -227,4 +290,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
