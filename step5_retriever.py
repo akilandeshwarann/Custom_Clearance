@@ -39,7 +39,7 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-from step4_index import tokenize  # reuse the same tokenizer used to build the BM25 index
+from step4_bm25_index import tokenize  # reuse the same tokenizer used to build the BM25 index
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 RRF_K = 60
